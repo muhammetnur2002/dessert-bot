@@ -1,20 +1,40 @@
 import logging
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.request import HTTPXRequest
-
 # ========== НАСТРОЙКИ ==========
-BOT_TOKEN = "8793875193:AAFoIJ30lxAF1EKOQtdHhylW6wTwBjc3nMM"   # Ваш токен
+# Берем токен и ID группы из переменных окружения (обязательно задайте их на Render!)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8793875193:AAFoIJ30lxAF1EKOQtdHhylW6wTwBjc3nMM")  # замените на свой токен, если не используете переменные
+GROUP_ID = int(os.environ.get("GROUP_ID", -1003871557312   ))  # замените на свой ID группы
 
-# ВНИМАНИЕ: ID группы должен быть отрицательным числом, например -1001234567890.
-# Получите его через @getidsbot.
-GROUP_ID = -1003871557312   # ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ОТРИЦАТЕЛЬНЫЙ ID ГРУППЫ
-
-# Прокси (если не нужен, оставить None)
-PROXY = None   # или "socks5://127.0.0.1:9150" при использовании Tor
+# Прокси (если не нужен, оставляем None)
+PROXY = None
 # ================================
 
-# Настройка HTTP-клиента
+# ---------- HTTP-сервер для Render ----------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        # Подавляем логи сервера (чтобы не засорять вывод)
+        pass
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 10000))  # Render передаёт PORT
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"HTTP server started on port {port}")
+    server.serve_forever()
+
+# Запускаем сервер в отдельном потоке (daemon=True, чтобы он завершился при остановке основного процесса)
+threading.Thread(target=run_http_server, daemon=True).start()
+# --------------------------------------------
+
+# Настройка HTTP-клиента для бота
 request = HTTPXRequest(
     proxy=PROXY,
     connect_timeout=30,
@@ -32,7 +52,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- КАТАЛОГ ТОВАРОВ ----------
-# Категории и товары в каждой категории (название, callback_data)
 CATEGORIES = {
     "cat_desserts": "🍰 Десерты",
     "cat_home":     "🧼 Хозяйственные товары",
@@ -60,7 +79,7 @@ ITEMS = {
     ]
 }
 
-# Для быстрого получения названия товара по callback_data
+# Словарь для быстрого получения названия по callback
 ITEM_NAME = {}
 for cat, items in ITEMS.items():
     for name, cb in items:
@@ -68,26 +87,24 @@ for cat, items in ITEMS.items():
 
 # ---------- ХРАНИЛИЩЕ ДАННЫХ ----------
 user_orders = {}          # {user_id: {callback: quantity}}
-user_temp_item = {}       # временно хранит выбранный товар перед выбором количества
-user_temp_edit = {}       # для редактирования
+user_temp_item = {}        # временно хранит выбранный товар перед выбором количества
+user_temp_edit = {}        # для редактирования
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def format_cart(user_id: int) -> str:
-    """Формирует сообщение с корзиной в требуемом формате."""
+    """Формирует сообщение с корзиной."""
     cart = user_orders.get(user_id, {})
     if not cart:
         return "Ваша корзина пуста."
     lines = ["Добрый день !", 'Заявка "Спартак":']
     for item_cb, qty in cart.items():
-        item_name = ITEM_NAME.get(item_cb, item_cb)  # на случай, если не найдётся
+        item_name = ITEM_NAME.get(item_cb, item_cb)
         lines.append(f"• {item_name}: {qty} шт.")
     return "\n".join(lines)
 
 def categories_keyboard():
     """Клавиатура с категориями."""
-    keyboard = []
-    for cat_cb, cat_name in CATEGORIES.items():
-        keyboard.append([InlineKeyboardButton(cat_name, callback_data=cat_cb)])
+    keyboard = [[InlineKeyboardButton(name, callback_data=cb)] for cb, name in CATEGORIES.items()]
     return InlineKeyboardMarkup(keyboard)
 
 def items_keyboard(category_cb: str):
@@ -98,7 +115,7 @@ def items_keyboard(category_cb: str):
     return InlineKeyboardMarkup(keyboard)
 
 def cart_keyboard(user_id: int):
-    """Клавиатура для просмотра корзины (подтвердить / редактировать)."""
+    """Клавиатура для просмотра корзины."""
     keyboard = [
         [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_order")],
         [InlineKeyboardButton("✅ Подтвердить заказ", callback_data="confirm_order")]
@@ -141,24 +158,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    # ---------- ВЫБОР КАТЕГОРИИ ----------
+    # Выбор категории
     if data in CATEGORIES:
         await query.edit_message_text(
             f"{CATEGORIES[data]}\nВыберите товар:",
             reply_markup=items_keyboard(data)
         )
-
-    # ---------- НАЗАД К КАТЕГОРИЯМ ----------
+    # Назад к категориям
     elif data == "back_to_categories":
         await query.edit_message_text(
             "🛒 Выберите категорию товаров:",
             reply_markup=categories_keyboard()
         )
-
-    # ---------- ВЫБОР ТОВАРА (из категории) ----------
-    elif data in ITEM_NAME:  # callback_data товара
+    # Выбор товара
+    elif data in ITEM_NAME:
         user_temp_item[user_id] = data
-        # Кнопки количества (1-5)
         keyboard = [
             [InlineKeyboardButton(str(i), callback_data=f"qty_{i}") for i in range(1, 4)],
             [InlineKeyboardButton(str(i), callback_data=f"qty_{i}") for i in range(4, 6)]
@@ -167,8 +181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Сколько штук?",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-
-    # ---------- ВЫБОР КОЛИЧЕСТВА ----------
+    # Выбор количества
     elif data.startswith("qty_"):
         qty = int(data.split("_")[1])
         item_cb = user_temp_item.pop(user_id, None)
@@ -176,7 +189,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id not in user_orders:
                 user_orders[user_id] = {}
             user_orders[user_id][item_cb] = user_orders[user_id].get(item_cb, 0) + qty
-            # Меню после добавления
             keyboard = [
                 [InlineKeyboardButton("🍩 Продолжить выбор", callback_data="continue")],
                 [InlineKeyboardButton("🛒 Оформить заказ", callback_data="checkout")]
@@ -185,15 +197,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ Товар добавлен в корзину!",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-
-    # ---------- ПРОДОЛЖИТЬ ВЫБОР ----------
+    # Продолжить выбор
     elif data == "continue":
         await query.edit_message_text(
             "🛒 Выберите категорию товаров:",
             reply_markup=categories_keyboard()
         )
-
-    # ---------- ПОКАЗАТЬ КОРЗИНУ ----------
+    # Показать корзину
     elif data == "checkout":
         if user_id not in user_orders or not user_orders[user_id]:
             await query.edit_message_text("Ваша корзина пуста. Начните с /start")
@@ -202,8 +212,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             format_cart(user_id),
             reply_markup=cart_keyboard(user_id)
         )
-
-    # ---------- ПОДТВЕРДИТЬ ЗАКАЗ ----------
+    # Подтверждение заказа (отправка в группу)
     elif data == "confirm_order":
         if user_id not in user_orders or not user_orders[user_id]:
             await query.edit_message_text("Корзина пуста.")
@@ -221,11 +230,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Ошибка: {e}\nПроверьте ID группы и права бота."
             )
             return
-        # Очищаем корзину
         del user_orders[user_id]
         await query.edit_message_text(f"{cart_text}\n\n✅ Заказ отправлен!")
-
-    # ---------- РЕДАКТИРОВАТЬ ЗАКАЗ (список позиций) ----------
+    # Редактирование (список позиций)
     elif data == "edit_order":
         if user_id not in user_orders or not user_orders[user_id]:
             await query.edit_message_text("Корзина пуста.")
@@ -234,8 +241,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выберите товар для изменения:",
             reply_markup=edit_list_keyboard(user_id)
         )
-
-    # ---------- ВЫБОР КОНКРЕТНОГО ТОВАРА ДЛЯ РЕДАКТИРОВАНИЯ ----------
+    # Выбор конкретного товара для редактирования
     elif data.startswith("edit_"):
         item_cb = data.replace("edit_", "")
         user_temp_edit[user_id] = item_cb
@@ -245,8 +251,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{item_name}\nТекущее количество: {current_qty} шт.\nЧто делаем?",
             reply_markup=item_edit_keyboard(item_cb)
         )
-
-    # ---------- ИЗМЕНЕНИЕ КОЛИЧЕСТВА ----------
+    # Изменение количества
     elif data.startswith("chg_"):
         parts = data.split("_")
         item_cb = parts[1]
@@ -257,7 +262,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_orders[user_id][item_cb] = new_qty
             else:
                 del user_orders[user_id][item_cb]
-        # Возврат к списку редактирования
         if not user_orders.get(user_id):
             await query.edit_message_text("Корзина пуста. /start")
             return
@@ -265,8 +269,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Количество изменено. Выберите товар:",
             reply_markup=edit_list_keyboard(user_id)
         )
-
-    # ---------- УДАЛЕНИЕ ПОЗИЦИИ ----------
+    # Удаление позиции
     elif data.startswith("del_"):
         item_cb = data.replace("del_", "")
         if user_id in user_orders and item_cb in user_orders[user_id]:
@@ -278,21 +281,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Позиция удалена. Выберите товар:",
             reply_markup=edit_list_keyboard(user_id)
         )
-
-    # ---------- НАЗАД К КОРЗИНЕ ----------
+    # Назад к корзине
     elif data == "back_to_cart":
         await query.edit_message_text(
             format_cart(user_id),
             reply_markup=cart_keyboard(user_id)
         )
-
-    # ---------- НАЗАД К СПИСКУ РЕДАКТИРОВАНИЯ ----------
+    # Назад к списку редактирования
     elif data == "back_to_edit_list":
         await query.edit_message_text(
             "Выберите товар для изменения:",
             reply_markup=edit_list_keyboard(user_id)
         )
-
     else:
         logger.warning(f"Неизвестный callback: {data}")
 
